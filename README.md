@@ -41,5 +41,6 @@ These limitations point to both architectural and data-related challenges.
 ## How to Run
 
 ```bash
+pip install -r requirements.txt
 python translate_script.py
 ```
