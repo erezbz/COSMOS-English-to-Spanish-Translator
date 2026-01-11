@@ -1,336 +1,403 @@
 import torch
 import torch.nn as nn
-import numpy as np
-import pygame
-import sys
-from collections import Counter
+import torch.nn.functional as F
+import pickle
+import re
+import unicodedata
+from typing import List, Optional
 
-from name_placeholder_utils import (
-    insert_placeholders_for_inference,
-    restore_entities,
-    tokenize,
-    get_entity_placeholders
-)
+# =========================
+# Vocabulary class
+# =========================
+class Vocabulary:
+    def __init__(self, min_freq: int = 1):
+        self.min_freq = min_freq
+        self.pad_token = "<pad>"
+        self.unk_token = "<unk>"
+        self.bos_token = "<bos>"
+        self.eos_token = "<eos>"
+        self.token_to_id = {}
+        self.id_to_token = {}
+        self.pad_id = None
+        self.unk_id = None
+        self.bos_id = None
+        self.eos_id = None
 
-# =====================
-# VOCAB
-# =====================
-class Vocab:
-    def __init__(self):
-        self.word2idx = {}
-        self.idx2word = {}
-        self.word_count = Counter()
+    def decode(self, ids: List[int]) -> List[str]:
+        tokens = []
+        for id_ in ids:
+            if id_ == self.eos_id:
+                break
+            token = self.id_to_token.get(id_, self.unk_token)
+            if token not in [self.pad_token, self.bos_token]:
+                tokens.append(token)
+        return tokens
 
-    def __len__(self):
-        return len(self.word2idx)
-    
-    def get_placeholder_ids(self):
-        """Get IDs of all placeholder tokens"""
-        placeholders = get_entity_placeholders()
-        return {self.word2idx[p] for p in placeholders if p in self.word2idx}
-
-
-# =====================
-# MODEL - Must match training script architecture
-# =====================
-class Transformer(nn.Module):
-    def __init__(self, src_vocab_size, tgt_vocab_size):
+# =========================
+# Attention mechanism
+# =========================
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
         super().__init__()
-        d_model = 256  # MUST MATCH TRAINING
+        self.attn = nn.Linear(hidden_size * 2, hidden_size)
+        self.v = nn.Linear(hidden_size, 1, bias=False)
         
-        self.src_emb = nn.Embedding(src_vocab_size, d_model, padding_idx=0)
-        self.tgt_emb = nn.Embedding(tgt_vocab_size, d_model, padding_idx=0)
+    def forward(self, hidden, encoder_outputs, mask=None):
+        batch_size = encoder_outputs.size(0)
+        src_len = encoder_outputs.size(1)
         
-        self.tf = nn.Transformer(
-            d_model=d_model,
-            nhead=8,
-            num_encoder_layers=4,
-            num_decoder_layers=4,
-            dim_feedforward=384,
-            batch_first=True
-        )
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        attention = self.v(energy).squeeze(2)
         
-        self.fc = nn.Linear(d_model, tgt_vocab_size)
+        if mask is not None:
+            attention = attention.masked_fill(mask == 0, -1e10)
+        
+        return F.softmax(attention, dim=1)
 
-    def forward(self, src, tgt):
-        src = self.src_emb(src)
-        tgt = self.tgt_emb(tgt)
+# =========================
+# Seq2Seq model with attention
+# =========================
+class Seq2SeqModel(nn.Module):
+    def __init__(self, src_vocab_size, tgt_vocab_size, src_pad_id, tgt_pad_id, 
+                 embed_size=256, hidden_size=512, num_layers=2, dropout=0.3):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
         
-        tgt_mask = self.tf.generate_square_subsequent_mask(
-            tgt.size(1)
-        ).to(tgt.device)
+        self.encoder_embedding = nn.Embedding(src_vocab_size, embed_size, padding_idx=src_pad_id)
+        self.encoder_rnn = nn.LSTM(embed_size, hidden_size, num_layers=num_layers, batch_first=True, 
+                                   dropout=dropout if num_layers > 1 else 0)
         
-        out = self.tf(src, tgt, tgt_mask=tgt_mask)
-        return self.fc(out)
+        self.decoder_embedding = nn.Embedding(tgt_vocab_size, embed_size, padding_idx=tgt_pad_id)
+        self.attention = Attention(hidden_size)
+        self.decoder_rnn = nn.LSTM(embed_size + hidden_size, hidden_size, num_layers=num_layers, 
+                                   batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        
+        self.output_layer = nn.Linear(hidden_size * 2, tgt_vocab_size)
+        self.dropout = nn.Dropout(dropout)
+        self.tgt_vocab = None
 
-# =====================
-# TRANSLATION WITH GREEDY PLACEHOLDER DECODING
-# =====================
-def translate(model, sentence, src_vocab, tgt_vocab, device, max_len=50):
+    def forward(self, src_ids, src_mask, tgt_ids=None, teacher_forcing_ratio=0.0):
+        batch_size = src_ids.size(0)
+        
+        src_embedded = self.dropout(self.encoder_embedding(src_ids))
+        encoder_outputs, (hidden, cell) = self.encoder_rnn(src_embedded)
+        
+        if tgt_ids is not None:
+            tgt_len = tgt_ids.size(1)
+        else:
+            tgt_len = 30
+        
+        logits = torch.zeros(batch_size, tgt_len, self.output_layer.out_features, device=src_ids.device)
+        input_ids = torch.full((batch_size,), self.tgt_vocab.bos_id, dtype=torch.long, device=src_ids.device)
+        
+        for t in range(tgt_len):
+            attn_weights = self.attention(hidden[-1], encoder_outputs, src_mask)
+            context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)
+            input_embedded = self.dropout(self.decoder_embedding(input_ids)).unsqueeze(1)
+            rnn_input = torch.cat((input_embedded, context), dim=2)
+            decoder_output, (hidden, cell) = self.decoder_rnn(rnn_input, (hidden, cell))
+            output = torch.cat((decoder_output.squeeze(1), context.squeeze(1)), dim=1)
+            output_step = self.output_layer(output)
+            
+            logits[:, t, :] = output_step
+            input_ids = output_step.argmax(dim=1)
+            
+            if (input_ids == self.tgt_vocab.eos_id).all():
+                break
+        
+        return logits
+
+# =========================
+# Utilities
+# =========================
+def normalize_text(text: str) -> str:
+    """Must match training normalization exactly"""
+    if not text:
+        return ""
+    text = str(text)
+    text = unicodedata.normalize("NFKC", text)
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def tokenize(text: str) -> List[str]:
+    """Simple whitespace tokenization"""
+    return text.split()
+
+def extract_entities(text: str) -> tuple[str, dict]:
     """
-    Translate with GREEDY decoding to ensure placeholder copying.
+    Extract entity placeholders like __ent1__, __ent2__, etc.
+    Returns: (text_with_placeholders, entity_map)
+    """
+    import re
+    entity_pattern = r'__ent\d+__'
+    entities = {}
     
-    Key changes:
-    1. Use argmax (greedy) instead of sampling
-    2. Strong penalty against reusing placeholders
-    3. Boost placeholder probabilities when they appear in source
+    for match in re.finditer(entity_pattern, text):
+        entity = match.group()
+        entities[entity] = entity  # Store original
+    
+    return text, entities
+
+def restore_entities(tokens: List[str], entity_map: dict) -> List[str]:
+    """
+    Replace entity placeholders in output with original entities
+    """
+    result = []
+    for token in tokens:
+        if token in entity_map:
+            result.append(entity_map[token])
+        else:
+            result.append(token)
+    return result
+
+def reconstruct_vocab(dicts) -> Vocabulary:
+    vocab = Vocabulary(min_freq=1)
+    vocab.token_to_id = dicts['token_to_id']
+    vocab.id_to_token = {int(k): v for k, v in dicts['id_to_token'].items()}
+    vocab.pad_id = vocab.token_to_id.get("<pad>", 0)
+    vocab.unk_id = vocab.token_to_id.get("<unk>", 1)
+    vocab.bos_id = vocab.token_to_id.get("<bos>", 2)
+    vocab.eos_id = vocab.token_to_id.get("<eos>", 3)
+    return vocab
+
+# =========================
+# Load vocab and model
+# =========================
+print("="*70)
+print("LOADING MODEL AND VOCABULARIES")
+print("="*70)
+
+print("\nLoading vocabularies...")
+with open("vocab/src_vocab.pkl", "rb") as f:
+    src_vocab = reconstruct_vocab(pickle.load(f))
+with open("vocab/tgt_vocab.pkl", "rb") as f:
+    tgt_vocab = reconstruct_vocab(pickle.load(f))
+
+print(f"✓ Source vocab size: {len(src_vocab.token_to_id)}")
+print(f"✓ Target vocab size: {len(tgt_vocab.token_to_id)}")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"✓ Using device: {device}")
+
+print("\nLoading model with attention...")
+
+# Load state dict to detect number of layers
+state_dict = torch.load("model/seq2seq_model.pth", map_location=device, weights_only=False)
+
+# Detect number of LSTM layers from state dict keys
+num_layers = 1
+for key in state_dict.keys():
+    if 'encoder_rnn.weight_ih_l' in key:
+        layer_num = int(key.split('_l')[-1]) + 1
+        num_layers = max(num_layers, layer_num)
+
+print(f"  Detected {num_layers} LSTM layers in saved model")
+
+model = Seq2SeqModel(
+    src_vocab_size=len(src_vocab.token_to_id),
+    tgt_vocab_size=len(tgt_vocab.token_to_id),
+    src_pad_id=src_vocab.pad_id,
+    tgt_pad_id=tgt_vocab.pad_id,
+    embed_size=256,
+    hidden_size=512,
+    num_layers=num_layers,  # Use detected number
+    dropout=0.3
+)
+model.tgt_vocab = tgt_vocab
+model.load_state_dict(state_dict)
+model.to(device)
+model.eval()
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f"✓ Model loaded successfully ({total_params:,} parameters)")
+
+# =========================
+# Beam Search Decoding
+# =========================
+def beam_search_decode(model, src_ids, src_mask, beam_width=5, max_len=30, length_penalty=0.6):
+    """
+    Beam search decoding for better translation quality
     """
     model.eval()
+    device = src_ids.device
     
-    # Step 1: Replace entities with placeholders
-    preprocessed, entity_map = insert_placeholders_for_inference(sentence)
+    # Encode source
+    src_embedded = model.dropout(model.encoder_embedding(src_ids))
+    encoder_outputs, (hidden, cell) = model.encoder_rnn(src_embedded)
     
-    print(f"  [DEBUG] Original:      {sentence}")
-    print(f"  [DEBUG] Preprocessed:  {preprocessed}")
-    print(f"  [DEBUG] Entity map:    {entity_map}")
+    # Initialize beams: (score, sequence, hidden, cell)
+    beams = [(0.0, [model.tgt_vocab.bos_id], hidden, cell)]
+    completed = []
     
-    # Step 2: Tokenize and convert to indices
-    src_tokens = tokenize(preprocessed)
+    for step in range(max_len):
+        candidates = []
+        
+        for score, seq, h, c in beams:
+            # Stop if EOS already generated
+            if seq[-1] == model.tgt_vocab.eos_id:
+                completed.append((score, seq))
+                continue
+            
+            # Get last token
+            input_id = torch.tensor([[seq[-1]]], device=device)
+            
+            # Attention
+            attn_weights = model.attention(h[-1], encoder_outputs, src_mask)
+            context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)
+            
+            # Decoder step
+            input_embedded = model.dropout(model.decoder_embedding(input_id))
+            rnn_input = torch.cat((input_embedded, context), dim=2)
+            decoder_output, (new_h, new_c) = model.decoder_rnn(rnn_input, (h, c))
+            
+            # Output probabilities
+            output = torch.cat((decoder_output.squeeze(1), context.squeeze(1)), dim=1)
+            logits = model.output_layer(output)
+            log_probs = F.log_softmax(logits, dim=1)
+            
+            # Get top k tokens
+            top_log_probs, top_indices = torch.topk(log_probs[0], beam_width)
+            
+            # Create new candidates
+            for log_prob, idx in zip(top_log_probs, top_indices):
+                new_score = score + log_prob.item()
+                new_seq = seq + [idx.item()]
+                
+                # Penalize repetition
+                if len(new_seq) >= 2 and new_seq[-1] == new_seq[-2]:
+                    new_score -= 2.0  # Penalty for repeating same word
+                
+                candidates.append((new_score, new_seq, new_h, new_c))
+        
+        # Keep top beam_width candidates
+        candidates.sort(key=lambda x: x[0] / (len(x[1]) ** length_penalty), reverse=True)
+        beams = candidates[:beam_width]
+        
+        # Early stopping if all beams completed
+        if not beams:
+            break
     
-    # Get all placeholder IDs
-    placeholder_ids = tgt_vocab.get_placeholder_ids()
+    # Add remaining beams to completed
+    completed.extend(beams)
     
-    # Find which placeholders are in the source
-    src_placeholders_present = set()
-    for token in src_tokens:
-        if token in tgt_vocab.word2idx and tgt_vocab.word2idx[token] in placeholder_ids:
-            src_placeholders_present.add(tgt_vocab.word2idx[token])
+    # Sort by score with length normalization
+    completed.sort(key=lambda x: x[0] / (len(x[1]) ** length_penalty), reverse=True)
     
-    print(f"  [DEBUG] Source placeholders: {[tgt_vocab.idx2word[p] for p in src_placeholders_present]}")
-    
-    src_ids = [src_vocab.word2idx.get(t, 3) for t in src_tokens]
-    src = torch.tensor([src_ids], device=device)
+    # Return best sequence
+    if completed:
+        best_seq = completed[0][1]
+        return best_seq[1:]  # Remove BOS token
+    else:
+        return []
 
-    tgt_ids = [1]  # <sos>
-    used_placeholders = set()
-    token_counts = {}  # Track repetition
-
-    # Step 3: GREEDY generation with placeholder tracking and repetition penalty
+# =========================
+# Translate function
+# =========================
+def translate(sentence: str, use_beam_search: bool = True, verbose: bool = False):
+    model.eval()
+    
+    # Extract entities before normalization
+    text_with_entities, entity_map = extract_entities(sentence)
+    
+    normalized = normalize_text(text_with_entities)
+    tokens = tokenize(normalized)
+    
+    if verbose:
+        print(f"\n  Original: '{sentence}'")
+        print(f"  Entities found: {list(entity_map.keys())}")
+        print(f"  Normalized: '{normalized}'")
+        print(f"  Tokens: {tokens}")
+    
+    if not tokens:
+        return "[Empty input]"
+    
+    # Encode
+    src_ids = [src_vocab.token_to_id.get(t, src_vocab.unk_id) for t in tokens]
+    src_mask = [1] * len(src_ids)
+    
+    # Pad to length 30
+    while len(src_ids) < 30:
+        src_ids.append(src_vocab.pad_id)
+        src_mask.append(0)
+    
+    src_tensor = torch.tensor([src_ids], device=device)
+    mask_tensor = torch.tensor([src_mask], device=device)
+    
+    # Translate
     with torch.no_grad():
-        for step in range(max_len):
-            tgt = torch.tensor([tgt_ids], device=device)
-            logits = model(src, tgt)[0, -1].clone()
-
-            # STRONG penalty for reusing placeholders
-            for used_ph in used_placeholders:
-                logits[used_ph] = -1e10  # Make it impossible to select again
-            
-            # PREVENT generating placeholders that aren't in the source
-            for ph_id in placeholder_ids:
-                if ph_id not in src_placeholders_present:
-                    logits[ph_id] = -1e10  # Don't generate placeholders not in input
-            
-            # REPETITION PENALTY: Penalize tokens that appear too often
-            for token_id, count in token_counts.items():
-                if count >= 2:  # If token appeared 2+ times already
-                    logits[token_id] -= 3.0 * count  # Increasing penalty
-            
-            # BOOST placeholders that should be in output but haven't been used
-            remaining_placeholders = src_placeholders_present - used_placeholders
-            if remaining_placeholders:
-                for ph_id in remaining_placeholders:
-                    logits[ph_id] += 5.0  # Boost unused placeholders
-            
-            # GREEDY: Take the most likely token (argmax)
-            next_token = logits.argmax().item()
-
-            if next_token == 2:  # <eos>
-                break
-
-            # Track placeholder usage
-            if next_token in placeholder_ids:
-                used_placeholders.add(next_token)
-                print(f"  [DEBUG] Generated placeholder: {tgt_vocab.idx2word[next_token]}")
-            
-            # Track token repetition
-            token_counts[next_token] = token_counts.get(next_token, 0) + 1
-
-            tgt_ids.append(next_token)
-
-    # Step 4: Reconstruct translation
-    words = [tgt_vocab.idx2word.get(i, "") for i in tgt_ids[1:] if i in tgt_vocab.idx2word]
-    translated = " ".join(words)
+        if use_beam_search:
+            predicted_ids = beam_search_decode(model, src_tensor, mask_tensor, beam_width=5)
+        else:
+            # Greedy decoding (old method)
+            logits = model(src_tensor, mask_tensor)
+            predicted_ids = [logits[0, t].argmax().item() for t in range(logits.size(1))]
     
-    print(f"  [DEBUG] Translated:    {translated}")
+    decoded = tgt_vocab.decode(predicted_ids)
     
-    # Step 5: Restore original entities
-    final_translation = restore_entities(translated, entity_map)
+    # Restore entities in output
+    if entity_map:
+        decoded = restore_entities(decoded, entity_map)
     
-    print(f"  [DEBUG] Final:         {final_translation}")
+    if not decoded:
+        return "[No translation generated]"
+    
+    return " ".join(decoded)
+
+# =========================
+# Interactive REPL
+# =========================
+def interactive_mode():
+    print("\n" + "="*70)
+    print("ENGLISH TO SPANISH TRANSLATION")
+    print("="*70)
+    print("\nCommands:")
+    print("  - Type a sentence to translate")
+    print("  - Type 'beam on/off' to toggle beam search (default: on)")
+    print("  - Type 'verbose on/off' to toggle detailed output")
+    print("  - Type 'quit' to exit")
     print()
     
-    return final_translation
-
-
-# =====================
-# UI HELPERS
-# =====================
-def wrap_text(text, font, max_width):
-    words = text.split()
-    lines, current = [], []
-    for w in words:
-        test = " ".join(current + [w])
-        if font.size(test)[0] <= max_width:
-            current.append(w)
-        else:
-            if current:
-                lines.append(" ".join(current))
-            current = [w]
-    if current:
-        lines.append(" ".join(current))
-    return lines
-
-
-# =====================
-# MAIN
-# =====================
-def main():
-    print("=" * 60)
-    print("🚀 English → Spanish Translator (FIXED Entity Preservation)")
-    print("=" * 60)
+    verbose = False
+    use_beam = True
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    print("\nLoading model...")
-    try:
-        ckpt = torch.load("translator_placeholder_fixed_fast.pth", map_location=device, weights_only=False)
-        src_vocab = ckpt["src_vocab"]
-        tgt_vocab = ckpt["tgt_vocab"]
-
-        model = Transformer(len(src_vocab), len(tgt_vocab)).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        model.eval()
+    while True:
+        sentence = input("EN> ").strip()
         
-        print(f"✓ Model loaded successfully!")
-        print(f"  Vocabularies: EN={len(src_vocab)}, ES={len(tgt_vocab)}")
+        if not sentence:
+            continue
         
-        # Verify placeholders
-        en_placeholders = src_vocab.get_placeholder_ids()
-        es_placeholders = tgt_vocab.get_placeholder_ids()
+        if sentence.lower() == "quit":
+            print("\nGoodbye!")
+            break
         
-        print(f"  EN placeholders in vocab: {len(en_placeholders)}")
-        print(f"  ES placeholders in vocab: {len(es_placeholders)}")
+        if sentence.lower().startswith("beam"):
+            if "on" in sentence.lower():
+                use_beam = True
+                print("  Beam search: ON (better quality, slower)\n")
+            elif "off" in sentence.lower():
+                use_beam = False
+                print("  Beam search: OFF (faster, greedy decoding)\n")
+            continue
         
-        if len(en_placeholders) == 0 or len(es_placeholders) == 0:
-            print("\n⚠️  WARNING: Placeholders NOT found in vocabulary!")
-            print("   Please retrain using the fixed training script.")
-            return
+        if sentence.lower().startswith("verbose"):
+            if "on" in sentence.lower():
+                verbose = True
+                print("  Verbose mode: ON\n")
+            elif "off" in sentence.lower():
+                verbose = False
+                print("  Verbose mode: OFF\n")
+            continue
         
-        print(f"  ✓ Placeholders verified in vocab")
+        translation = translate(sentence, use_beam_search=use_beam, verbose=verbose)
+        print(f"ES> {translation}")
         print()
-    except FileNotFoundError:
-        print(f"❌ Error: 'translator_entity_fixed.pth' not found!")
-        print("\nPlease train the model first using the fixed training script.")
-        return
-    except Exception as e:
-        print(f"❌ Error loading model: {e}")
-        return
 
-    # Test the entity preservation system
-    print("\n" + "=" * 60)
-    print("Testing entity preservation with GREEDY decoding:")
-    print("-" * 60)
-    
-    test_sentences = [
-        "Hello my name is Bob",
-        "Alice and Charlie are friends",
-        "Maria went to the store",
-        "I met David yesterday",
-        "Bob and Alice went to New York"
-    ]
-    
-    for test in test_sentences:
-        print(f"\nEN: {test}")
-        result = translate(model, test, src_vocab, tgt_vocab, device)
-        print(f"ES: {result}")
-    
-    print("\n" + "=" * 60)
-    print("Starting translator interface...")
-    pygame.init()
-
-    WIDTH, HEIGHT = 800, 600
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("English → Spanish Translator (FIXED)")
-
-    font = pygame.font.Font(None, 28)
-    title_font = pygame.font.Font(None, 46)
-    small_font = pygame.font.Font(None, 20)
-    clock = pygame.time.Clock()
-
-    input_text = ""
-    translation = ""
-    translating = False
-
-    running = True
-    while running:
-        clock.tick(60)
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_RETURN and input_text.strip() and not translating:
-                    translating = True
-                    translation = translate(
-                        model, input_text, src_vocab, tgt_vocab, device
-                    )
-                    translating = False
-                elif event.key == pygame.K_BACKSPACE:
-                    input_text = input_text[:-1]
-                    translation = ""
-                elif event.key == pygame.K_ESCAPE:
-                    input_text = ""
-                    translation = ""
-                else:
-                    if len(input_text) < 200:
-                        input_text += event.unicode
-
-        # Draw background
-        screen.fill((30, 30, 40))
-
-        # Draw title
-        title = title_font.render("Translator (FIXED)", True, (120, 255, 120))
-        screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 20))
-
-        # Draw instructions
-        instructions = small_font.render(
-            "Type in English and press ENTER | ESC to clear | Names preserved with GREEDY decoding",
-            True, (150, 255, 150)
-        )
-        screen.blit(instructions, (WIDTH // 2 - instructions.get_width() // 2, 70))
-
-        # Draw English input
-        screen.blit(font.render("English:", True, (180, 180, 180)), (50, 110))
-        pygame.draw.rect(screen, (80, 80, 100), (50, 140, 700, 50), 2, border_radius=5)
-        
-        input_lines = wrap_text(input_text, font, 680)
-        y_offset = 150
-        for line in input_lines[:2]:
-            screen.blit(font.render(line, True, (255, 255, 255)), (60, y_offset))
-            y_offset += 30
-
-        # Draw translation
-        if translating:
-            screen.blit(font.render("Translating...", True, (255, 200, 100)), (50, 220))
-        elif translation:
-            screen.blit(font.render("Spanish:", True, (180, 180, 180)), (50, 220))
-            pygame.draw.rect(screen, (50, 50, 60), (50, 250, 700, 300), border_radius=5)
-            pygame.draw.rect(screen, (100, 255, 100), (50, 250, 700, 300), 2, border_radius=5)
-
-            y = 270
-            for line in wrap_text(translation, font, 680):
-                screen.blit(font.render(line, True, (200, 255, 200)), (60, y))
-                y += 35
-                if y > 520:
-                    break
-
-        pygame.display.flip()
-
-    pygame.quit()
-    sys.exit()
-
-
+# =========================
+# Main
+# =========================
 if __name__ == "__main__":
-    main()
+    interactive_mode()
